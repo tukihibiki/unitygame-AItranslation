@@ -76,6 +76,7 @@ class HanhuaGUI:
         # Defer network polling to avoid blocking startup
         self.root.after(500, self._poll_server_status)
         self.root.after(1000, self._start_history_polling)
+        self.root.after(1500, self._poll_log_from_history)
 
     # ─── Style ──────────────────────────────────────────────────
 
@@ -292,8 +293,11 @@ class HanhuaGUI:
         # Right: history
         right_frame = ttk.Frame(split_pane, width=400)
         split_pane.add(right_frame, weight=3)
-        ttk.Label(right_frame, text="翻译历史", font=("Microsoft YaHei UI", 9, "bold"),
-                  foreground="#569cd6").pack(anchor="w")
+        hist_title = ttk.Frame(right_frame)
+        hist_title.pack(fill="x")
+        ttk.Label(hist_title, text="翻译历史", font=("Microsoft YaHei UI", 9, "bold"),
+                  foreground="#569cd6").pack(side="left")
+        ttk.Button(hist_title, text="刷新", command=self._refresh_history).pack(side="right")
         hist_cols = ("time", "model", "source", "dur")
         self._hist_tree = ttk.Treeview(right_frame, columns=hist_cols, show="headings", height=8)
         self._hist_tree.heading("time", text="时间")
@@ -308,7 +312,6 @@ class HanhuaGUI:
         self._hist_tree.configure(yscrollcommand=hist_scroll.set)
         self._hist_tree.pack(side="left", fill="both", expand=True)
         hist_scroll.pack(side="right", fill="y")
-        ttk.Button(right_frame, text="刷新", command=self._refresh_history).pack(anchor="e", pady=(2, 0))
 
         self._game_menu = tk.Menu(self.root, tearoff=0, bg="#2d2d2d", fg="#d4d4d4")
         self._game_menu.add_command(label="启动游戏", command=lambda: self._launch_game(auto_start=True))
@@ -477,6 +480,7 @@ class HanhuaGUI:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
             threading.Thread(target=self._read_server_output, daemon=True).start()
             self._start_btn.configure(state="disabled")
@@ -570,15 +574,6 @@ class HanhuaGUI:
                 pass
             self.root.after(0, self._on_server_dead)
         threading.Thread(target=check, daemon=True).start()
-
-        # Process log queue
-        while not self._log_queue.empty():
-            try:
-                line = self._log_queue.get_nowait()
-                self._parse_server_log(line)
-            except queue.Empty:
-                break
-
         self._status_id = self.root.after(3000, self._poll_server_status)
 
     def _on_server_alive(self):
@@ -613,33 +608,38 @@ class HanhuaGUI:
         self._stop_stats_polling()
 
     def _parse_server_log(self, line: str):
-        """Parse server stdout and add to log tree."""
-        if "Received:" in line:
-            try:
-                text = line.split("Received:", 1)[1].strip().strip("'")
-                if len(text) < 3 or text.startswith("[") or text.startswith("\\x"):
-                    return
-                # Store for pairing with Translated
-                self._last_received = text
-            except Exception:
-                return
-        elif "Translated:" in line:
-            try:
-                text = line.split("Translated:", 1)[1].strip().strip("'")
-                if text.startswith("[") and text.endswith("]"):
-                    return  # Skip error messages
-                source = getattr(self, "_last_received", "") or "..."
-                now = time.strftime("%H:%M:%S")
-                self.root.after(0, lambda s=source, t=text, n=now: self._add_log_entry(n, s, t))
-            except Exception:
-                return
+        """Parse server stdout — unused, kept for compatibility."""
+        pass
 
     def _add_log_entry(self, time_str: str, source: str, target: str):
+        """Add entry from history API JSON (clean Unicode)."""
         items = self._log_tree.get_children()
         if len(items) >= 200:
             self._log_tree.delete(items[0])
         self._log_tree.insert("", "end", values=(time_str, source[:60], target[:60]))
         self._log_tree.yview_moveto(1.0)
+
+    def _poll_log_from_history(self):
+        """Poll /history API to populate real-time log tree (clean JSON, no encoding issues)."""
+        def fetch():
+            try:
+                import urllib.request, json
+                resp = urllib.request.urlopen(f"{SERVER_URL}/history?limit=20", timeout=2)
+                rows = json.loads(resp.read().decode())
+                self.root.after(0, lambda: self._update_log_tree(rows))
+            except Exception:
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
+        self.root.after(3000, self._poll_log_from_history)
+
+    def _update_log_tree(self, rows):
+        existing = {self._log_tree.item(i)["values"][0]: i for i in self._log_tree.get_children()}
+        for r in reversed(rows):
+            key = r["time"]
+            if key not in existing:
+                source = r["source"][:50]
+                target = r["target"][:50]
+                self._add_log_entry(r["time"], source, target)
 
     def _clear_log(self):
         for item in self._log_tree.get_children():
