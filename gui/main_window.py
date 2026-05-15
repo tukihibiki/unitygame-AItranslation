@@ -71,10 +71,11 @@ class HanhuaGUI:
         self._build_ui()
         self._load_config()
         self._load_games()
-        self._poll_server_status()
-        self._start_history_polling()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Defer network polling to avoid blocking startup
+        self.root.after(500, self._poll_server_status)
+        self.root.after(1000, self._start_history_polling)
 
     # ─── Style ──────────────────────────────────────────────────
 
@@ -556,32 +557,19 @@ class HanhuaGUI:
             pass
 
     def _poll_server_status(self):
-        """Periodically check if server is running (auto-detect)."""
-        port = self._port_var.get()
-        try:
-            import urllib.request
-            resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
-            if resp.status == 200:
-                if self._server_status_var.get() not in ("● 运行中", "● 启动中..."):
-                    self._server_status_var.set("● 运行中")
-                    self._server_status_label.configure(foreground="#4ec94e")
-                    self._start_btn.configure(state="disabled")
-                    self._stop_btn.configure(state="normal")
-                # Find PID
-                import subprocess as sp
-                r = sp.run(['netstat', '-ano'], capture_output=True, text=True)
-                for line in r.stdout.split('\n'):
-                    if f':{port}' in line and 'LISTENING' in line:
-                        pid = line.strip().split()[-1]
-                        self._server_pid_var.set(f"PID {pid}")
-                        break
-        except Exception:
-            if self._server_status_var.get() != "● 未启动":
-                self._server_status_var.set("● 未启动")
-                self._server_status_label.configure(foreground="#888")
-                self._start_btn.configure(state="normal")
-                self._stop_btn.configure(state="disabled")
-                self._server_pid_var.set("")
+        """Check server status in background thread."""
+        def check():
+            port = self._port_var.get()
+            try:
+                import urllib.request
+                resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+                if resp.status == 200:
+                    self.root.after(0, self._on_server_alive)
+                    return
+            except Exception:
+                pass
+            self.root.after(0, self._on_server_dead)
+        threading.Thread(target=check, daemon=True).start()
 
         # Process log queue
         while not self._log_queue.empty():
@@ -591,7 +579,30 @@ class HanhuaGUI:
             except queue.Empty:
                 break
 
-        self._status_id = self.root.after(2000, self._poll_server_status)
+        self._status_id = self.root.after(3000, self._poll_server_status)
+
+    def _on_server_alive(self):
+        port = self._port_var.get()
+        import subprocess as sp
+        r = sp.run(['netstat', '-ano'], capture_output=True, text=True)
+        pid_str = ""
+        for line in r.stdout.split('\n'):
+            if f':{port}' in line and 'LISTENING' in line:
+                pid_str = f"PID {line.strip().split()[-1]}"
+                break
+        self._server_status_var.set("● 运行中")
+        self._server_status_label.configure(foreground="#4ec94e")
+        self._start_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._server_pid_var.set(pid_str)
+
+    def _on_server_dead(self):
+        if self._server_status_var.get() != "● 未启动":
+            self._server_status_var.set("● 未启动")
+            self._server_status_label.configure(foreground="#888")
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._server_pid_var.set("")
 
     def _on_server_died(self):
         self._server_process = None
@@ -645,22 +656,28 @@ class HanhuaGUI:
             self._stats_update_id = None
 
     def _poll_stats(self):
-        try:
-            resp = urlopen(f"{SERVER_URL}/stats", timeout=2)
-            data = json.loads(resp.read().decode())
-            text = (
-                f"请求总数: {data.get('requests', 0):>5}  |  "
-                f"本地AI: {data.get('local_hits', 0):>4}  |  "
-                f"云端AI: {data.get('cloud_hits', 0):>4}  |  "
-                f"缓存命中: {data.get('cache_hits', 0):>5}  |  "
-                f"缓存条目: {data.get('cache_entries', 0):>5}  |  "
-                f"费用: ${data.get('llm_cost', 0):.5f}"
-            )
-            self._stats_text.delete("1.0", "end")
-            self._stats_text.insert("1.0", text)
-        except Exception:
-            pass
+        def fetch():
+            try:
+                import urllib.request, json
+                resp = urllib.request.urlopen(f"{SERVER_URL}/stats", timeout=2)
+                data = json.loads(resp.read().decode())
+                text = (
+                    f"请求总数: {data.get('requests', 0):>5}  |  "
+                    f"本地AI: {data.get('local_hits', 0):>4}  |  "
+                    f"云端AI: {data.get('cloud_hits', 0):>4}  |  "
+                    f"缓存命中: {data.get('cache_hits', 0):>5}  |  "
+                    f"缓存条目: {data.get('cache_entries', 0):>5}  |  "
+                    f"费用: ${data.get('llm_cost', 0):.5f}"
+                )
+                self.root.after(0, lambda t=text: self._update_stats(t))
+            except Exception:
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
         self._stats_update_id = self.root.after(3000, self._poll_stats)
+
+    def _update_stats(self, text):
+        self._stats_text.delete("1.0", "end")
+        self._stats_text.insert("1.0", text)
 
     # ─── Game Management ────────────────────────────────────────
 
@@ -880,29 +897,29 @@ class HanhuaGUI:
             self._game_tree.insert("", "end", values=(g["name"], g["folder"], g["type"], injected))
 
     def _refresh_history(self):
-        """Load recent translation history from server."""
-        try:
-            import urllib.request, json
-            resp = urllib.request.urlopen(f"{SERVER_URL}/history?limit=50", timeout=3)
-            rows = json.loads(resp.read().decode())
-            for item in self._hist_tree.get_children():
-                self._hist_tree.delete(item)
-            for r in rows:
-                source = r["source"][:30]
-                target = r["target"][:30]
-                display = f"{source} -> {target}"
-                model = r.get("model", "")
-                if model == "hybrid":
-                    ai = "local"
-                elif "deepseek" in model:
-                    ai = "cloud"
-                else:
-                    ai = model[:6]
-                dur = f"{r.get('duration_ms', 0):.0f}ms"
-                self._hist_tree.insert("", "end", values=(r["time"], ai, display, dur))
-        except Exception as e:
-            print(f"History error: {e}")
+        """Load history in background thread."""
+        def fetch():
+            try:
+                import urllib.request, json
+                resp = urllib.request.urlopen(f"{SERVER_URL}/history?limit=50", timeout=2)
+                rows = json.loads(resp.read().decode())
+                self.root.after(0, lambda: self._update_history_tree(rows))
+            except Exception:
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
         self.root.after(5000, self._refresh_history)
+
+    def _update_history_tree(self, rows):
+        for item in self._hist_tree.get_children():
+            self._hist_tree.delete(item)
+        for r in rows:
+            source = r["source"][:30]
+            target = r["target"][:30]
+            display = f"{source} -> {target}"
+            model = r.get("model", "")
+            ai = "local" if model == "hybrid" else "cloud" if "deepseek" in model else model[:6]
+            dur = f"{r.get('duration_ms', 0):.0f}ms"
+            self._hist_tree.insert("", "end", values=(r["time"], ai, display, dur))
 
     def _start_history_polling(self):
         self._refresh_history()
